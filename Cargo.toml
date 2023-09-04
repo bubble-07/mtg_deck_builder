@@ -10,5 +10,6 @@ strum="0.25"
 strum_macros="0.25"
 json="0.12.4"
 anyhow="1.0.72"
-ndarray="0.15.6"
-ndarray-linalg="0.16.0"
+ndarray={version = "0.15.4"}
+rand="0.8.5"
+rand_distr="0.4.3"
