@@ -3,33 +3,46 @@ use rand::Rng;
 use rand_distr::WeightedIndex;
 use rand_distr::Distribution;
 use std::env;
-use std::ops::AddAssign;
-use std::ops::MulAssign;
 use std::io::BufRead;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ops::AddAssign;
+use serde_derive::{Deserialize, Serialize};
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
-use anyhow::bail;
 use ndarray::*;
+use ndarray_linalg::UPLO;
+use stats::OnlineStats;
+use std::str::FromStr;
+use nalgebra_sparse::coo::CooMatrix;
+use nalgebra_sparse::csr::CsrMatrix;
+use ndarray_rand::RandomExt;
+use ndarray_rand::rand_distr::StandardNormal;
+use ndarray_linalg::qr::QR;
+use ndarray_linalg::Eigh;
+
+extern crate openblas_src;
 
 // TODO: We currently don't understand the "partner" mechanic -
 // could we fix that?
-
-
-// TODO: Parsing the CSVs and computing the derived data
-// for combined_data seems like they're the slowest steps.
 
 fn print_usage() -> ! {
     println!("Usage:");
     println!("cargo run card_incidence_stats mtgtop8 [mtg_top_8_data_base_directory]");
     println!("cargo run card_incidence_stats protour [mtg_pro_tour_csv]");
     println!("cargo run card_incidence_stats deckstobeat [deckstobeat_base_directory]");
+    println!("cargo run card_incidence_stats edhrec [edhrec_json_base_directory]");
     println!("cargo run merge_incidence_stats [incidence_csv_one] [incidence_csv_two]");
     println!("cargo run combine_incidence_stats_with_metadata [incidence_csv] [metadata_csv]");
     println!("cargo run card_metadata [scryfall_oracle_cards_db_file]");
-    println!("cargo run rank_commanders [combined_data_csv]");
-    println!("cargo run build_commander_deck [combined_data_csv] [commander_name]");
+    println!("cargo run card_names_from_metadata [metadata_csv]");
+    println!("cargo run preprocess [combined_data_csv] [destination]");
+    println!("cargo run complete [method] [preprocessed_data] [destination]");
+    println!("cargo run merge_preprocessed_trusted_with_untrusted [trusted_preprocessed_data] [untrusted_preprocessed_data] [destination]");
+    println!("cargo run filter_preprocessed [preprocessed_data] [card_list] [destination]");
+    println!("cargo run suggest_card_purchases [preprocessed_data] [card_list]");
+    println!("cargo run rank_commanders [preprocessed_data]");
+    println!("cargo run build_commander_deck [preprocessed_data] [commander_name]");
     panic!();
 }
 
@@ -65,11 +78,17 @@ fn format_card_name(raw_card_name: &str) -> String {
     format!("\"{}\"", escaped_card_name)
 }
 
-struct CombinedData {
-    ids: HashMap<String, usize>,
-    // Indexed by ID
-    metadata: Vec<CardMetadata>,
-    counts: HashMap<(usize, usize), usize>,
+fn sparse_times_dense(sparse: &CsrMatrix<f64>, dense: ArrayView2<f32>) 
+    -> Array2<f32> {
+    let (l, m) = (sparse.nrows(), sparse.ncols());
+    let n = dense.shape()[1];
+    let mut result = Array::zeros((l, n));
+    for (i, j, sparse_value) in sparse.triplet_iter() {
+        for k in 0..n {
+            result[[i, k]] += (*sparse_value as f32) * dense[[j, k]];
+        }
+    }
+    result
 }
 
 struct Constraint {
@@ -160,7 +179,7 @@ impl Constraints {
 /// to generate all such pairs, with random ordering.
 /// Some pairs may be visited more than once.
 struct SwapIndexIterator<'a> {
-    weighted_index: &'a WeightedIndex<f64>,
+    weighted_index: &'a WeightedIndex<f32>,
     iter_count: usize,
     full_set_size: usize,
     random_choice_iteration_bound: usize,
@@ -168,7 +187,7 @@ struct SwapIndexIterator<'a> {
 }
 
 impl<'a> SwapIndexIterator<'a> {
-    pub fn new(weighted_index: &'a WeightedIndex<f64>,
+    pub fn new(weighted_index: &'a WeightedIndex<f32>,
         full_set_size: usize, random_choice_iteration_bound: usize) -> Self {
         Self {
             weighted_index,
@@ -270,17 +289,491 @@ const VALID_PLANESWALKER_COMMANDERS: [&str; 29] = [
     "Kytheon, Hero of Akros // Gideon, Battle-Forged",
 ];
 
-impl CombinedData {
+fn as_sparse(dense: &Array2<f32>) -> (CsrMatrix<f64>, usize) {
+    let mut nnz = 0;
+    let (rows, cols) = (dense.shape()[0], dense.shape()[1]);
+    let mut result = CooMatrix::new(rows, cols);
+    for ((i, j), value) in dense.indexed_iter() {
+        let value = *value as f64;
+        if value != 0.0 {
+            result.push(i, j, value);
+            nnz += 1;
+        }
+    }
+    (CsrMatrix::from(&result), nnz)
+}
+
+fn to_sparse(dense: Array2<f32>) -> (CsrMatrix<f64>, usize) {
+    as_sparse(&dense)
+}
+
+fn low_rank_entry(U: ArrayView2<f32>, S: ArrayView1<f32>, 
+                  i: usize, j: usize) -> f32 {
+    let mut result = 0.0;
+    for k in 0..U.shape()[1] {
+        // We do this directly to avoid extraneous allocations
+        // in a tight loop.
+        result += U[[i, k]] * U[[j, k]] * S[[k]];
+    }
+    result
+}
+fn low_rank_multiply(U: ArrayView2<f32>, S: ArrayView1<f32>, 
+                     A: ArrayView2<f32>) -> Array2<f32> {
+    let mut transformed = U.t().dot(&A);
+    for ((i, j), value) in transformed.indexed_iter_mut() {
+        *value *= S[[i,]];
+    }
+    U.dot(&transformed)
+}
+fn low_rank_sketch(U: ArrayView2<f32>, S: ArrayView1<f32>,
+                   Q: ArrayView2<f32>) -> Array2<f32> {
+    let sketch_rhs = U.t().dot(&Q); // dims (s x s)
+    let mut sketch_rhs_scaled = sketch_rhs.clone();
+    for ((i, j), value) in sketch_rhs_scaled.indexed_iter_mut() {
+        *value *= S[[i,]];
+    }
+    sketch_rhs.t().dot(&sketch_rhs_scaled) // dims (s x s)
+}
+
+// Combined data which has been pre-processed to bring
+// it into a form which is immediately usable by the
+// rank_commanders and build_commander_deck commands.
+#[derive(Debug, Serialize, Deserialize)]
+struct PreprocessedData {
+    card_names: Vec<String>, 
+    metadata: Vec<CardMetadata>,
+    score_matrix: Array2<f32>,
+}
+
+impl PreprocessedData {
+    fn write_to_path(&self, path: &str) -> anyhow::Result<()> {
+        let bytes: Vec<u8> = postcard::to_allocvec(&self)?;
+        std::fs::write(path, &bytes)?;
+        Ok(())
+    }
+    fn load_from_path(path: &str) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let result: PreprocessedData = postcard::from_bytes(&bytes)?;
+        Ok(result)
+    }
+    fn complete_soft_impute(mut self) -> Self {
+        // Uses a simplified version of https://arxiv.org/pdf/1703.05487.pdf
+        // employing a randomized SVD https://gregorygundersen.com/blog/2019/01/17/randomized-svd/
+        //
+        // The first algorithm is in turn an accelerated version of:
+        // https://www.jmlr.org/papers/volume11/mazumder10a/mazumder10a.pdf
+        let n = self.metadata.len();
+        // The initial number of singular values to compute
+        let mut num_singular_values = 2;
+        let num_singular_values_growth_rate = 2.0;
+
+        let (sparse_score_matrix, nnz) = to_sparse(self.score_matrix);
+
+        //TODO: Allow customization!
+        let singular_value_threshold = 0.001;
+        println!("singular value threshold: {}", singular_value_threshold);        
+
+        let step_size = 1.0;
+        println!("Step size: {}", step_size);
+
+        let epsilon = 0.01 * 0.01;
+
+        let mut original_matrix_frobenius_norm = 0.0;
+        for (_, _, value) in sparse_score_matrix.triplet_iter() {
+            original_matrix_frobenius_norm += *value * *value;
+        }
+        let original_matrix_frobenius_norm = original_matrix_frobenius_norm.sqrt();
+
+        // c is a counter which determines how much sequence
+        // acceleration to apply
+        let mut c: usize = 1;
+
+        // From iteration to iteration, we maintain X = U S U^T as the
+        // current best-estimate, but we also need to maintain
+        // an X_old in order to apply the acceleration strategy.
+        let mut U_old = Array::zeros((n, num_singular_values));
+        let mut S_old = Array::zeros((num_singular_values,));
+        let mut U = Array::zeros((n, num_singular_values));
+        let mut S = Array::zeros((num_singular_values,));
+
+        let mut objective_value = f32::MAX;
+        let mut old_objective_value = f32::MAX;
+
+        loop {
+            // Find the value of theta, which determines how "aggressive"
+            // we want to be with respect to acceleration.
+            let theta = ((c - 1) as f32) / ((c + 2) as f32);
+            let one_plus_theta = 1.0 + theta;
+
+            // Now, we have the logical assignment
+            // Y = (1 + theta) X - theta X_old
+
+            // Now, we'll be setting Z = Y + A,
+            // where A is a sparse matrix given by
+            // step_size * (P_{\omega}(O) - P_{\omega}(Y)).
+            
+            // First, compute the sparse component A
+            let mut sparse_component = sparse_score_matrix.clone();
+            for (i, j, value) in sparse_component.triplet_iter_mut() {
+                // Compute the (i, j) entry of X right here
+                let x_value = low_rank_entry(U.view(), S.view(), i, j);
+                // Compute the (i, j) entry of X_old
+                let x_old_value = low_rank_entry(U_old.view(), S_old.view(), i, j);
+                *value -= (one_plus_theta * x_value - theta * x_old_value) as f64;
+                *value *= step_size;
+            }
+            // Now we have everything we need for Z, so time to compute
+            // the SVT of that using a randomized SVD.
+            // First, we're gonna approximate the range of Z
+            let random_vectors = Array::random((n, num_singular_values), StandardNormal);
+
+            let mut sparse_transformed = sparse_times_dense(&sparse_component, random_vectors.view());
+            let y_transformed = one_plus_theta * 
+                low_rank_multiply(U.view(), S.view(), random_vectors.view()) - 
+            theta *
+                low_rank_multiply(U_old.view(), S_old.view(), random_vectors.view());
+                              
+            let transformed = sparse_transformed + &y_transformed;
+            // Q now contains an orthonormal approxmation of the
+            // range of Z - this is of shape (n, s) [s number of singular vals]
+            let (Q, _) = transformed.qr().unwrap();
+
+            
+            // Now, use the derived orthogonal projection to sketch Z
+
+            // Sketch Y
+            let y_sketched = one_plus_theta * 
+                low_rank_sketch(U.view(), S.view(), Q.view()) -
+            theta *
+                low_rank_sketch(U_old.view(), S_old.view(), Q.view());
+
+            // Sketch the sparse part
+            let sparse_sketched = sparse_times_dense(&sparse_component, Q.view());
+            let sparse_sketched = Q.t().dot(&sparse_sketched);
+
+            // Combine into one sketch
+            let sketched = y_sketched + &sparse_sketched;
+
+            
+            // Compute eigh of the sketch
+            let (sketch_s, sketch_u) = sketched.eigh(UPLO::Upper).unwrap();
+
+
+            // Persist the old values for S and U, since we're about to
+            // update them.
+            S_old = S;
+            U_old = U;
+
+            // Scale the eigh of the sketch up to get new values for S and U,
+            // but where S hasn't yet been singular-value-truncated.
+            S = sketch_s;
+            U = Q.dot(&sketch_u);
+
+            // Check to see whether/not we need to increase the number
+            // of singular values to compute for the next iteration.
+            let mut have_enough_singular_values = false;
+            let mut x_nuclear_norm = 0.0;
+            for value in S.iter() {
+                let abs_value = value.abs();
+                x_nuclear_norm += abs_value;
+                if abs_value <= singular_value_threshold {
+                    // We could threshold, so we have enough.
+                    have_enough_singular_values = true;
+                }
+            }
+            // Perform the singular value truncation.
+            // This completes our update to X.
+            for singular_value in S.iter_mut() {
+                if singular_value.abs() <= singular_value_threshold {
+                    *singular_value = 0.0;
+                } else if *singular_value > 0.0 {
+                    *singular_value -= singular_value_threshold;
+                } else if *singular_value < 0.0 {
+                    *singular_value += singular_value_threshold;
+                }
+            }
+            
+            // Adjust the number of singular values to compute if
+            // we need to.
+            if !have_enough_singular_values {
+                num_singular_values = 
+                    ((num_singular_values as f64) * 
+                     num_singular_values_growth_rate) as usize;
+                num_singular_values = num_singular_values.min(n);
+                println!("Number of singular values increased: {}", 
+                         num_singular_values);
+            }
+
+            // Now, determine what the new objective value is, and
+            // adjust our parameters if it's a significant
+            // regression from previous iterations.
+            let mut diff_frobenius_norm_sq = 0.0;
+            for (i, j, value) in sparse_score_matrix.triplet_iter() {
+                let x_value = low_rank_entry(U.view(), S.view(), i, j);
+                let diff = (*value as f32) - x_value;
+                diff_frobenius_norm_sq += diff * diff;
+            }
+            old_objective_value = objective_value;
+            objective_value = 0.5 * diff_frobenius_norm_sq + 
+                              singular_value_threshold * x_nuclear_norm;
+
+            println!("Objective value: {}, Frob norm: {}", objective_value,
+                     diff_frobenius_norm_sq.sqrt());
+            if objective_value > old_objective_value {
+                // Regression, lay off the acceleration
+                c = 1;
+            } else {
+                // Go faster!
+                c += 1;
+            }
+        }
+    }
+    fn complete_svt(mut self) -> Self {
+        let n = self.metadata.len();
+        // The initial number of singular values to compute (less than
+        // the total number of singular values) - gets multiplied by
+        // a constant every time that more are needed.
+        let mut num_singular_values = 2;
+        // The growth rate for the number of singular values
+        let num_singular_values_growth_rate = 2.0;
+
+        // Uses https://arxiv.org/pdf/0810.3286.pdf
+        let (sparse_score_matrix, nnz) = to_sparse(self.score_matrix);
+
+        // Pick the singular value threshold to be the largest singular
+        // value in the original matrix, so that it's roughly proportional.
+        let initial_svd_result = svdlibrs::svd_dim(&sparse_score_matrix, 2).unwrap();
+        let singular_value_threshold = initial_svd_result.s[[0,]];
+        println!("singular value threshold: {}", singular_value_threshold);
+
+        // Per the paper, pick the step size between 0 and 2
+        let step_size = 2.0;
+        println!("step size: {}", step_size);
+
+        // The relative error at which we'll accept the reconstruction
+        // For our problem, we pick this so that we'd expect that
+        // the synergy scores of two valid commander decks don't
+        // change their synergy ranking pre-and-post-completion,
+        // assuming that all pairwise synergies were originally defined.
+        let epsilon = 0.01 * 0.01;
+
+        let mut X: Array2<f32> = Array::zeros((n, n));
+        let mut Y: CsrMatrix<f64> = sparse_score_matrix.clone();
+
+        let mut original_matrix_frobenius_norm = 0.0;
+        for (_, _, value) in sparse_score_matrix.triplet_iter() {
+            original_matrix_frobenius_norm += *value * *value;
+        }
+        let original_matrix_frobenius_norm = original_matrix_frobenius_norm.sqrt();
+
+        loop {
+            // First, update X by computing the singular value shrinkage
+            // operator on the previous value of Y
+            let mut svd_result = svdlibrs::svd_dim(&Y, num_singular_values).unwrap();
+            // Check to see whether/not we need to increase the number
+            // of singular values to compute for the next iteration.
+            let mut have_enough_singular_values = false;
+            for value in svd_result.s.iter() {
+                if *value <= singular_value_threshold {
+                    // We could threshold, so we have enough.
+                    have_enough_singular_values = true;
+                }
+            }
+
+            if !have_enough_singular_values {
+                num_singular_values = 
+                    ((num_singular_values as f64) * 
+                     num_singular_values_growth_rate) as usize;
+                num_singular_values = num_singular_values.min(n);
+                println!("Number of singular values increased: {}", 
+                         num_singular_values);
+            }
+
+            // Shrinkage operator on all of the s values
+            for singular_value in svd_result.s.iter_mut() {
+                *singular_value -= singular_value_threshold;
+                if *singular_value < 0.0 {
+                    *singular_value = 0.0;
+                }
+            }
+            // Now, reconstruct the X matrix 
+            let mut s_vt = svd_result.vt;
+            for ((i, j), value) in s_vt.indexed_iter_mut() {
+                *value *= svd_result.s[[i,]];
+            }
+            let s_vt = s_vt.mapv(|x| x as f32);
+            let u = svd_result.ut.t().mapv(|x| x as f32);
+            X = u.dot(&s_vt);
+
+            let mut diff_frobenius_norm = 0.0;
+
+            // X matrix reconstructed, now update Y
+            for ((i, j, y_value), (_, _, m_value)) in 
+                Y.triplet_iter_mut().zip(sparse_score_matrix.triplet_iter()) {
+                let x_value = X[[i, j]] as f64;
+                let diff = m_value - x_value;
+                let step = step_size * diff;
+                *y_value += step;
+                diff_frobenius_norm += diff * diff;
+            }
+            let diff_frobenius_norm = diff_frobenius_norm.sqrt();
+            println!("Diff Frobenius norm this iteration: {}",
+                diff_frobenius_norm);
+            if diff_frobenius_norm <= original_matrix_frobenius_norm * epsilon {
+                break;
+            }
+        }
+        self.score_matrix = X;
+        self
+    }
+    fn suggest_card_purchases(self, card_list: DeckList) {
+        let mut name_to_id_map = HashMap::new();
+        for (id, card_name) in self.card_names.iter().enumerate() {
+            name_to_id_map.insert(card_name.to_string(), id); 
+        }
+        // TODO: Should make this handle the case where the
+        // deck list actually just has single-sides of double-faced cards
+        let mut my_cards_vec = Array::zeros((self.metadata.len(),));
+        for card in card_list.cards.into_iter() {
+            if let Some(my_card_id) = name_to_id_map.get(&card) {
+                my_cards_vec[[*my_card_id]] = 1.0;
+            }
+        }
+        // Tallies the scores of other cards against my cards
+        let active_score = self.score_matrix.dot(&my_cards_vec);
+        let mut result = Vec::new();
+        for (id, card_name) in self.card_names.into_iter().enumerate() {
+            if my_cards_vec[[id]] > 0.0 {
+                // We already have it
+                continue;
+            }
+            let price_cents = self.metadata[id].price_cents;
+            if price_cents == 0 {
+                // Price is actually undefined, skip 
+                continue;
+            }
+            let score = active_score[[id]];
+            let score_per_cent = score / (price_cents as f32);
+            let price = (price_cents as f32) / 100.0;
+            result.push((card_name, score, score_per_cent, price));
+        }
+        result.sort_by(|(_, a, _, _), (_, b, _, _)| b.partial_cmp(&a).unwrap());
+
+        for (card_name, score, score_per_cent, price) in result.into_iter() {
+            println!("{}, {}, {}, {}", format_card_name(&card_name), 
+                     score, score_per_cent, price);
+        }
+    }
+    fn merge_with_untrusted(self, mut untrusted: PreprocessedData) -> Self {
+        // First, determine the empirical multiplier for untrusted elements
+        // in order to adjust them into the range of trusted values
+        let mut my_card_name_to_id = HashMap::new();
+        for (i, card_name) in self.card_names.iter().enumerate() {
+            my_card_name_to_id.insert(card_name.to_string(), i);
+        }
+
+        let mut other_id_to_my_id = HashMap::new();
+        for (other_id, card_name) in untrusted.card_names.iter().enumerate() {
+            if let Some(my_id) = my_card_name_to_id.get(card_name) {
+                other_id_to_my_id.insert(other_id, *my_id);
+            }
+        }
+
+        let mut empirical_multiplier_stats = OnlineStats::new();
+
+        for i_other in 0..untrusted.metadata.len() {
+            if let Some(i_mine) = other_id_to_my_id.get(&i_other) {
+                for j_other in 0..untrusted.metadata.len() {
+                    if let Some(j_mine) = other_id_to_my_id.get(&j_other) {
+                        let my_value = self.score_matrix[[*i_mine, *j_mine]];
+                        let other_value = untrusted.score_matrix[[i_other, j_other]];
+                        if my_value != 0.0 && other_value != 0.0 {
+                            let empirical_multiplier = (my_value as f64) / (other_value as f64);
+                            empirical_multiplier_stats.add(empirical_multiplier);
+                        }
+                    }
+                }
+            }
+        }
+        // Return the empirical multiplier mean minus the standard
+        // deviation, which is guaranteed to be greater than zero,
+        // but if the multipliers were normally distributed, it would
+        // encompass a >80% CI.
+        let adjusted_multiplier: f32 = (empirical_multiplier_stats.mean()
+            - empirical_multiplier_stats.stddev()) as f32;
+
+        // Now, mutate the untrusted values
+        // NOTE: We assume that the "untrusted" data
+        // every card in it!
+        for ((i_other, j_other), value) in untrusted.score_matrix.indexed_iter_mut() {
+            // First, adjust by the requested multiplier
+            *value *= adjusted_multiplier;
+            if let Some(i_mine) = other_id_to_my_id.get(&i_other) {
+                if let Some(j_mine) = other_id_to_my_id.get(&j_other) {
+                    // If the trusted matrix has a nonzero entry, substitute it.
+                    let trusted_value = self.score_matrix[[*i_mine, *j_mine]];
+                    if trusted_value != 0.0 {
+                        *value = trusted_value;
+                    }
+                }
+            }
+        }
+        untrusted
+    }
+    fn filter(self, criteria: impl Fn(&str, &CardMetadata) -> bool) -> Self {
+        // First, scan through and assign new contiguous indices to all matches
+        // We can straightforwardly update the names and metadata
+        // for this in one go.
+        let mut new_id_to_old_id = Vec::new();
+
+        let mut metadata = Vec::new();
+        let mut card_names = Vec::new();
+
+        for (old_id, card_name) in self.card_names.into_iter().enumerate() {
+            let card_metadata = &self.metadata[old_id];
+            if !criteria(&card_name, card_metadata) {
+                continue;
+            }
+            new_id_to_old_id.push(old_id);
+            metadata.push(card_metadata.clone());
+            card_names.push(card_name);
+        }
+        
+        let metadata = metadata;
+        let card_names = card_names;
+
+        // Now, using the old-id-to-new-ID map, update the score matrix
+        let mut score_matrix = Array::zeros((metadata.len(), metadata.len()));
+        for ((new_id_one, new_id_two), value) in score_matrix.indexed_iter_mut() {
+            let old_id_one = new_id_to_old_id[new_id_one];
+            let old_id_two = new_id_to_old_id[new_id_two];
+            *value = self.score_matrix[[old_id_one, old_id_two]];
+        }
+        let score_matrix = score_matrix;
+        Self {
+            metadata,
+            card_names,
+            score_matrix    
+        }
+    }
+    fn get_id_from_name(&self, name: &str) -> Option<usize> {
+        for (id, card_name) in self.card_names.iter().enumerate() {
+            if card_name == name {
+                return Some(id);
+            }
+        }
+        None
+    }
     pub fn build_commander_deck(self, commander_name: &str) {
         // SETUP
 
         // Early bail if we can't get the ID
-        let commander_id = *self.ids.get(commander_name)
+        let commander_id = self.get_id_from_name(commander_name)
             .expect("No commander was found by that name");
 
         // Early bail if there's not 100 or more cards
         // in the IDs
-        if self.ids.len() < 100 {
+        if self.card_names.len() < 100 {
             panic!("Not enough cards to build a commander deck");
         }
 
@@ -293,19 +786,26 @@ impl CombinedData {
             metadata.color_identity.fits_within(commander_color_identity)
         });
 
+        // After filtering, the commander's ID will be different, but no biggie.
+        let commander_id = filtered_data.get_id_from_name(commander_name).unwrap();
+
         // Get all counts for the data-set, and all ids-to-names
-        let mut score_matrix = filtered_data.get_score_matrix();
-        let reverse_id_map = filtered_data.get_reverse_id_map();
+        let mut score_matrix = filtered_data.score_matrix;
+        let reverse_id_map = filtered_data.card_names;
         let metadata = filtered_data.metadata;
 
         let num_cards_in_pool = metadata.len();
 
         // Now, adjust the scores of the basic lands so that they're
         // smaller than the scores of all other cards
-        let mut basic_land_ids = HashSet::new();
+        let mut basic_land_names = HashSet::new();
         for basic_land_name in BASIC_LAND_NAMES {
-            if let Some(id) = filtered_data.ids.get(basic_land_name) {
-                basic_land_ids.insert(*id);
+            basic_land_names.insert(basic_land_name.to_string());
+        }
+        let mut basic_land_ids = HashSet::new();
+        for (id, name) in reverse_id_map.iter().enumerate() {
+            if basic_land_names.contains(name) {
+                basic_land_ids.insert(id);
             }
         }
         let basic_land_ids = basic_land_ids;
@@ -314,18 +814,13 @@ impl CombinedData {
             let land_color = metadata[*basic_land_id].color_identity;
             for i in 0..num_cards_in_pool {
                 let other_color = metadata[i].color_identity;
-                let value = if land_color.fits_within(other_color) {
-                    0.0000001
-                } else {
-                    0.0
-                };
-                score_matrix[[i, *basic_land_id]] = value;
-                score_matrix[[*basic_land_id, i]] = value;
+                if land_color.fits_within(other_color) {
+                    let value = 0.0000001;
+                    score_matrix[[i, *basic_land_id]] = value;
+                    score_matrix[[*basic_land_id, i]] = value;
+                }
             }
         }
-       
-        // After filtering, the commander's ID will be different, but no biggie.
-        let commander_id = *filtered_data.ids.get(commander_name).unwrap();
 
         // Adjust the incidence scores of the commander to incorporate
         // a multiplier for just how much more frequently we expect
@@ -389,31 +884,17 @@ impl CombinedData {
 
         let mut rng = rand::thread_rng();
 
-        // This is something which will ease in computing changes to the objective
-        // function quickly
-        let mut diffing_matrix = Array::zeros((num_cards_in_pool, num_cards_in_pool));
-        for index_removed in 0..num_cards_in_pool {
-            for index_added in 0..num_cards_in_pool {
-                diffing_matrix[[index_removed, index_added]] =
-                        score_matrix[[index_added, index_added]]
-                        - 2.0 * score_matrix[[index_added, index_removed]]
-                        + score_matrix[[index_removed, index_removed]];
-            }
-        }
-        let diffing_matrix = diffing_matrix;
-
         let mut weights = Vec::new();
         // Construct the initial set of weighted probabilities which
         // we'll always use to pick the initial set of cards to draw from
         let mut total_commander_synergy = 0.0;
-        for i in 0..num_cards_in_pool {
-            total_commander_synergy += score_matrix[[commander_id, i]];
+        for commander_synergy in score_matrix.row(commander_id).iter() {
+            total_commander_synergy += commander_synergy;
         }
-        for i in 0..num_cards_in_pool {
-            let commander_synergy = score_matrix[[commander_id, i]];
+        for commander_synergy in score_matrix.row(commander_id).iter() {
             let commander_synergy_as_probability = commander_synergy / total_commander_synergy;
             // Take that, and average with a uniform distribution
-            let uniform_probability = 1.0 / (num_cards_in_pool as f64);
+            let uniform_probability = 1.0 / (num_cards_in_pool as f32);
             // TODO: allow configuring this value
             let alpha = 0.1;
             let weight = alpha * uniform_probability + (1.0 - alpha) * commander_synergy_as_probability;
@@ -434,7 +915,7 @@ impl CombinedData {
             let mut active_set = Array::zeros((num_cards_in_pool,));
 
             active_set_indices.push(commander_id);
-            active_set[[commander_id,]] = 1.0f64;
+            active_set[[commander_id,]] = 1.0f32;
 
             while active_set_indices.len() < 100 {
                 let random_index = weighted_index.sample(&mut rng);
@@ -454,9 +935,10 @@ impl CombinedData {
 
             // Determine the current objective value
             let mut objective_value = active_set.dot(&score_matrix).dot(&active_set);
+
             // Determine the active score, which is going to be
             // a vector that we'll update frequently
-            let mut active_score = active_set.dot(&score_matrix);
+            let mut active_score = score_matrix.dot(&active_set);
            
             let mut still_working = true;
             // Kick off the main optimization loop
@@ -495,10 +977,14 @@ impl CombinedData {
                     let is_feasible = updated_constraint_count_distance == 0;
                     
                     // Determine what the updated objective value would be.
+                    let diffing_value = 
+                        score_matrix[[index_added, index_added]]
+                        - 2.0 * score_matrix[[index_added, index_removed]]
+                        + score_matrix[[index_removed, index_removed]];
 
                     let updated_objective_value = objective_value
                         + 2.0 * (active_score[[index_added,]] - active_score[[index_removed,]])
-                        + diffing_matrix[[index_removed, index_added]];
+                        + diffing_value;
 
                     if is_feasible && objective_value >= updated_objective_value {
                         // Still feasible, but doesn't make the objective
@@ -507,7 +993,8 @@ impl CombinedData {
                     }
 
                     let updated_active_score = &active_score
-                        + &score_matrix.row(index_added) - &score_matrix.row(index_removed);
+                        + &score_matrix.row(index_added)
+                        - &score_matrix.row(index_removed);
 
                     // Great, let's pick it. Update all state variables appropriately.
                     active_set[[index_added,]] += 1.0;
@@ -533,13 +1020,13 @@ impl CombinedData {
             }
         }
 
-        let active_score = best_active_set.dot(&score_matrix);
+        let active_score = score_matrix.dot(&best_active_set);
 
         // Order `best_active_set_indices` by decreasing order
         // of contribution to the total overall score.
         let mut sorted_indices = Vec::new();
         // Always put the commander at the top of the list
-        sorted_indices.push((best_active_set_indices[0], f64::MAX));
+        sorted_indices.push((best_active_set_indices[0], f32::MAX));
         for i in 1..best_active_set_indices.len() {
             sorted_indices.push((best_active_set_indices[i], active_score[[i,]]));
         }
@@ -562,14 +1049,13 @@ impl CombinedData {
         }
     }
 
-    pub fn rank_commanders(&self) {
-        let reverse_id_map = self.get_reverse_id_map();
-        let score_matrix = self.get_score_matrix();
+    pub fn rank_commanders(self) {
+        let reverse_id_map = self.card_names;
+        let score_matrix = self.score_matrix;
 
         let mut names_and_scores_by_number_of_colors = vec![Vec::new(); 6];
 
-        let n = self.metadata.len();
-        for commander_index in 0..n {
+        for (commander_index, score_matrix_row) in score_matrix.outer_iter().enumerate() {
             let commander_metadata = &self.metadata[commander_index];
             if !commander_metadata.card_types.is_possibly_valid_commander() {
                 continue;
@@ -585,12 +1071,11 @@ impl CombinedData {
             let number_of_colors = color_identity.number_of_colors();
             // Collect the scores of all cards in the commander's color identity
             let mut valid_color_identity_scores = Vec::new();
-            for other_index in 0..n {
+            for (other_index, score) in score_matrix_row.indexed_iter() {
                 let other_metadata = &self.metadata[other_index];
                 let other_color_identity = other_metadata.color_identity;
                 if other_color_identity.fits_within(color_identity) {
-                    let score = score_matrix[[commander_index, other_index]];
-                    valid_color_identity_scores.push(score);
+                    valid_color_identity_scores.push(*score);
                 }
             }
             // Sort the scores and extract just the top 100
@@ -599,7 +1084,7 @@ impl CombinedData {
             valid_color_identity_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
             valid_color_identity_scores.truncate(100);
 
-            let total_score: f64 = valid_color_identity_scores.iter().sum();
+            let total_score: f32 = valid_color_identity_scores.iter().sum();
             let name = &reverse_id_map[commander_index];
 
             names_and_scores_by_number_of_colors[number_of_colors].push((name, total_score));
@@ -616,6 +1101,25 @@ impl CombinedData {
             println!("");
         }
     }
+}
+
+struct CombinedData {
+    ids: HashMap<String, usize>,
+    // Indexed by ID
+    metadata: Vec<CardMetadata>,
+    counts: HashMap<(usize, usize), usize>,
+}
+
+impl CombinedData {
+    pub fn preprocess(self) -> PreprocessedData {
+        let card_names = self.get_reverse_id_map();
+        let score_matrix = self.get_score_matrix();
+        PreprocessedData {
+            card_names,
+            score_matrix,
+            metadata: self.metadata,
+        }
+    }
     pub fn get_reverse_id_map(&self) -> Vec<String> {
         let mut result = vec![None; self.metadata.len()];
         for (name, id) in self.ids.iter() {
@@ -626,7 +1130,7 @@ impl CombinedData {
             .collect();
         result
     }
-    pub fn get_score_matrix(&self) -> Array2<f64> {
+    pub fn get_score_matrix(&self) -> Array2<f32> {
         // We take the raw count matrix
         // and turn it into scores by taking
         // the natural logarithm of 1 + the entries.
@@ -640,28 +1144,32 @@ impl CombinedData {
         // in top-ranked tournament play has to do with the
         // fact that there's an implicit smooth maximization
         // taking place there.
-        let dense_counts = self.get_dense_counts();
-        let mut dense_scores = dense_counts.mapv(|x| x.ln_1p());
-        for ((i, j), value) in dense_scores.indexed_iter_mut() {
+        let mut result = self.get_counts_matrix();
+        for ((i, j), value) in result.indexed_iter_mut() {
+            let mut updated_value = value.ln_1p();
             if i != j {
                 // Halve off-diagonal values so that when
                 // using them in the quadratic program, they sum
                 // to the strength scoring for the pair.
-                value.mul_assign(0.5);
+                updated_value *= 0.5;
             }
+            // Little bit of normalization to bring ourselves to a reasonable range
+            updated_value *= 0.01;
+            *value = updated_value;
         }
-        // Little bit of normalization to bring ourselves to a reasonable range
-        dense_scores * 0.01
+        result
     }
-    pub fn get_dense_counts(&self) -> Array2<f64> {
+    pub fn get_counts_matrix(&self) -> Array2<f32> {
         let dim = self.metadata.len();
         // Pack the incidence counts into an array
-        let mut similarity_array = Array::<f64, _>::zeros((dim, dim));
-        for ((i, j), value) in similarity_array.indexed_iter_mut() {
-            if let Some(count) = self.counts.get(&(i, j)) {
-                value.add_assign(*count as f64);
-            } else if let Some(count) = self.counts.get(&(j, i)) {
-                value.add_assign(*count as f64);
+        let mut similarity_array = Array::zeros((dim, dim));
+        for i in 0..dim {
+            for j in 0..dim {
+                if let Some(count) = self.counts.get(&(i, j)) {
+                    similarity_array[[i, j]] = *count as f32;
+                } else if let Some(count) = self.counts.get(&(j, i)) {
+                    similarity_array[[i, j]] = *count as f32;
+                }
             }
         }
         similarity_array
@@ -752,64 +1260,25 @@ impl CombinedData {
         }
     }
 
-    fn filter(self, criteria: impl Fn(&str, &CardMetadata) -> bool) -> Self {
-        // First, scan through and assign new contiguous indices to all matches
-        // We can straightforwardly update the ID mapping and metadata
-        // for this in one go.
-        let mut next_id = 0;
-        let mut old_id_to_new_id = HashMap::new();
-
-        let mut metadata = Vec::new();
-        let mut ids = HashMap::new();
-
-        for (card_name, old_id) in self.ids.into_iter() {
-            let card_metadata = &self.metadata[old_id];
-            if !criteria(&card_name, card_metadata) {
-                continue;
-            }
-            old_id_to_new_id.insert(old_id, next_id);
-            metadata.push(card_metadata.clone());
-            ids.insert(card_name.to_string(), next_id);
-            next_id += 1;
-        }
-        
-        let metadata = metadata;
-        let ids = ids;
-
-        // Now, using the old-to-new ID map, update the counts
-        let mut counts = HashMap::new();
-        for ((old_id_one, old_id_two), count) in self.counts.into_iter() {
-            if let Some(new_id_one) = old_id_to_new_id.get(&old_id_one) {
-                if let Some(new_id_two) = old_id_to_new_id.get(&old_id_two) {
-                    counts.insert((*new_id_one, *new_id_two), count);
-                }
-            }
-        }
-        let counts = counts;
-        Self {
-            metadata,
-            ids,
-            counts,
-        }
-    }
-
     fn load_from_csv<R: std::io::Read>(file: R) -> anyhow::Result<Self> {
         let mut ids = HashMap::new();
         let mut metadata_map = HashMap::new();
         let mut counts = HashMap::new();
 
         for parts in iter_csv_rows(file) {
-            if parts.len() == 5 {
+            if parts.len() == 6 {
                 let card_name = parse_card_name(&parts[0]);
                 let card_id = parts[1].trim().parse::<usize>().unwrap();
                 let card_types = CardTypes::parse_from_characters(parts[2].trim());
                 let color_identity = 
                     ColorIdentity::parse_from_characters(parts[3].trim());
                 let cmc = parts[4].trim().parse::<usize>().unwrap() as u8;
+                let price_cents = parts[5].trim().parse::<usize>().unwrap() as u16;
                 let metadata = CardMetadata {
                     card_types,
                     color_identity,
                     cmc,
+                    price_cents,
                 };
                 ids.insert(card_name.to_string(), card_id);
                 metadata_map.insert(card_id, metadata);
@@ -844,12 +1313,14 @@ impl CombinedData {
             let card_types = metadata.card_types.as_characters();
             let color_identity = metadata.color_identity.as_characters();
             let cmc = metadata.cmc;
-            println!("{}, {}, {}, {}, {}", 
+            let price_cents = metadata.price_cents;
+            println!("{}, {}, {}, {}, {}, {}", 
                     format_card_name(name),
                     card_id,
                     card_types,
                     color_identity,
-                    cmc);
+                    cmc,
+                    price_cents);
         }
         for ((id_one, id_two), count) in self.counts.iter() {
             println!("{}, {}, {}", id_one, id_two, count);
@@ -888,16 +1359,18 @@ impl CardsMetadata {
         let mut cards = HashMap::new();
         let mut double_faced_cards = HashMap::new();
         for parts in iter_csv_rows(file) {
-            if parts.len() == 4 {
+            if parts.len() == 5 {
                 let card_name = parse_card_name(&parts[0]);
                 let card_types = CardTypes::parse_from_characters(parts[1].trim());
                 let color_identity = 
                     ColorIdentity::parse_from_characters(parts[2].trim());
                 let cmc = parts[3].trim().parse::<usize>().unwrap() as u8;
+                let price_cents = parts[4].trim().parse::<usize>().unwrap() as u16;
                 let metadata = CardMetadata {
                     card_types,
                     color_identity,
                     cmc,
+                    price_cents,
                 };
                 cards.insert(card_name.to_string(), metadata);
             } else if parts.len() == 2 {
@@ -911,13 +1384,23 @@ impl CardsMetadata {
             double_faced_cards,
         })
     }
+    fn print_card_names(&self) {
+        for (card_name, _) in self.cards.iter() {
+            println!("{}", card_name);
+        }
+        for (face_name, _) in self.double_faced_cards.iter() {
+            println!("{}", face_name);
+        }
+    }
     fn print(&self) {
         for (card_name, metadata) in self.cards.iter() {
             let card_types = metadata.card_types.as_characters();
             let color_identity = metadata.color_identity.as_characters();
             let cmc = metadata.cmc;
-            println!("{}, {}, {}, {}", 
-            format_card_name(card_name), card_types, color_identity, cmc);
+            let price_cents = metadata.price_cents;
+            println!("{}, {}, {}, {}, {}", 
+            format_card_name(card_name), card_types, color_identity, cmc,
+                             price_cents);
         }
         for (face_name, card_name) in self.double_faced_cards.iter() {
             println!("{}, {}",
@@ -968,7 +1451,7 @@ impl CardType {
 }
 
 #[derive(Default)]
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 struct CardTypes {
     bitfield: u8,
 }
@@ -1060,7 +1543,7 @@ impl Color {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 struct ColorIdentity {
     bitfield: u8,
 }
@@ -1128,11 +1611,12 @@ impl MetadataFilter {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 struct CardMetadata {
     card_types: CardTypes,
     color_identity: ColorIdentity,
     cmc: u8,
+    price_cents: u16,
 }
 
 struct CsvRowIterator<R: std::io::Read> {
@@ -1260,6 +1744,11 @@ impl CardIncidenceStats {
             id
         }
     }
+    fn set_id_pair(&mut self, first_card_id: usize, second_card_id: usize,
+        increment: usize) {
+        let card_pair = (first_card_id, second_card_id);
+        self.counts.insert(card_pair, increment);
+    }
     fn add_to_id_pair(&mut self, first_card_id: usize, second_card_id: usize,
                       increment: usize) {
         let card_pair = (first_card_id, second_card_id);
@@ -1312,6 +1801,31 @@ impl DeckList {
             result.insert(card);
         }
         result
+    }
+    /// Update single-face card names to their double-faced names
+    fn normalize_against_preprocessed(self, preprocessed: &PreprocessedData)
+        -> Self {
+        let mut card_face_to_double_faced = HashMap::new();
+        for card_name in preprocessed.card_names.iter() {
+            if card_name.contains("//") {
+                let (side_a, side_b) = card_name.split_once("//").unwrap();
+                let side_a = side_a.trim();
+                let side_b = side_b.trim();
+                card_face_to_double_faced.insert(side_a.to_string(), card_name.to_string());
+                card_face_to_double_faced.insert(side_b.to_string(), card_name.to_string());
+            }
+        }
+        let mut cards = Vec::new();
+        for name in self.cards.into_iter() {
+            if let Some(double_faced_name) = card_face_to_double_faced.get(&name) {
+                cards.push(double_faced_name.to_string());
+            } else {
+                cards.push(name);
+            }
+        }
+        Self {
+            cards,
+        }
     }
 }
 
@@ -1425,6 +1939,56 @@ fn card_incidence_stats_from_mtgtop8(base_directory_name: &str) ->
     Ok(card_incidence_stats)
 }
 
+fn card_incidence_stats_from_edhrec(base_directory_name: &str) ->
+    anyhow::Result<CardIncidenceStats> {
+    let cards_directory = std::path::Path::new(base_directory_name);
+
+    let mut card_incidence_stats = CardIncidenceStats::new();
+
+    for card_json_file in std::fs::read_dir(cards_directory)? {
+        let card_json_file = card_json_file?;
+        let card_json_file = card_json_file.path();
+        let card_json = std::fs::read_to_string(card_json_file.clone())?;
+        if let Ok(mut card_json) = json::parse(&card_json) {
+            let mut header = card_json.remove("header");
+            let header = header.take_string().unwrap();
+            let card_name = header.replace(" (Card)", "");
+            let card_list = card_json.remove("cardlist");
+
+            let card_id = card_incidence_stats.get_card_id(card_name.clone());
+            
+            if let json::JsonValue::Array(mut card_list) = card_list {
+                let mut total_decks_card_is_in = 0;
+                for mut other_card_json in card_list.drain(..) {
+                    let mut other_card_name = other_card_json.remove("name");
+                    let other_card_name = other_card_name.take_string().unwrap();
+
+                    let other_card_id = card_incidence_stats.get_card_id(other_card_name.clone());
+
+                    let num_decks = other_card_json.remove("num_decks");
+                    let num_decks = num_decks.as_usize().unwrap();
+
+                    let potential_decks = other_card_json.remove("potential_decks");
+                    let potential_decks = potential_decks.as_usize().unwrap();
+
+                    // Inevitably, there will be some card which is colorless
+                    // in this list. 
+                    total_decks_card_is_in = total_decks_card_is_in.max(potential_decks);
+
+                    // Add what we learned to the incidence stats
+                    if card_name <= other_card_name {
+                        card_incidence_stats.set_id_pair(card_id, other_card_id, num_decks);
+                    } else {
+                        card_incidence_stats.set_id_pair(other_card_id, card_id, num_decks);
+                    }
+                }
+                card_incidence_stats.set_id_pair(card_id, card_id, total_decks_card_is_in);
+            }
+        }
+    }
+    Ok(card_incidence_stats)
+}
+
 fn cards_metadata_from_scryfall(oracle_cards_json_filename: &str) ->
     anyhow::Result<CardsMetadata> {
     let mut double_faced_cards = HashMap::new();
@@ -1484,12 +2048,29 @@ fn cards_metadata_from_scryfall(oracle_cards_json_filename: &str) ->
                 }
                 let mut cmc = 0u8;
                 if let Some(cmc_float) = maybe_cmc {
-                    cmc = cmc_float.as_f64().unwrap() as u8;
+                    cmc = cmc_float.as_f32().unwrap() as u8;
                 }
+                // Attempt to obtain the price in cents - default is 0,
+                // indicating not defined.
+                let mut price_cents: u16 = 0;
+                if let Some(json::JsonValue::Object(mut prices_object)) = 
+                    object.remove("prices") {
+                    let price_usd = prices_object.remove("usd").unwrap();
+                    if !price_usd.is_null() {
+                        let price_string = price_usd.as_str().unwrap();
+                        let price_float = f64::from_str(&price_string).unwrap();
+                        let price_float = price_float * 100.0;
+                        // Saturating cast to a u16 range
+                        price_cents = price_float as u16;
+                    }
+                }
+
+
                 let metadata = CardMetadata {
                     card_types,
                     color_identity,
                     cmc,
+                    price_cents,
                 };
                 result.insert(name.to_string(), metadata);
 
@@ -1535,6 +2116,9 @@ fn main() -> anyhow::Result<()> {
                 "deckstobeat" => {
                     card_incidence_stats_from_deckstobeat(&args[3])?
                 },
+                "edhrec" => {
+                    card_incidence_stats_from_edhrec(&args[3])?
+                },
                 _ => {
                     print_usage();
                 },
@@ -1551,18 +2135,36 @@ fn main() -> anyhow::Result<()> {
             incidence_stats_one.merge(incidence_stats_two);
             incidence_stats_one.print();
         },
-        "filter_combined_data" => {
+        "preprocess" => {
             let combined_data_csv = &args[2];
-            let card_list = &args[3];
+            let destination = &args[3];
             let combined_data_csv = std::fs::File::open(combined_data_csv)?;
+            let combined_data = CombinedData::load_from_csv(combined_data_csv)?;
+            let preprocessed_data = combined_data.preprocess();
+            preprocessed_data.write_to_path(destination)?;
+        },
+        "merge_preprocessed_trusted_with_untrusted" => {
+            let trusted_filename = &args[2];
+            let untrusted_filename = &args[3];
+            let destination = &args[4];
+            let trusted_preprocessed = PreprocessedData::load_from_path(trusted_filename)?;
+            let untrusted_preprocessed = PreprocessedData::load_from_path(untrusted_filename)?;
+            let merged = trusted_preprocessed.merge_with_untrusted(untrusted_preprocessed);
+            merged.write_to_path(destination)?;
+        },
+        "filter_preprocessed" => {
+            let preprocessed_data = &args[2];
+            let card_list = &args[3];
+            let destination = &args[4];
             let card_list = std::fs::File::open(card_list)?;
-            let combined_data_csv = CombinedData::load_from_csv(combined_data_csv)?;
+            let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
             let card_list = card_listing_from_file(card_list)?;
+            let card_list = card_list.normalize_against_preprocessed(&preprocessed_data);
             let card_name_set = card_list.into_card_name_set();
-            let combined_data_csv = combined_data_csv.filter(|card_name, _| {
+            let preprocessed_data = preprocessed_data.filter(|card_name, _| {
                 card_name_set.contains(card_name)
             });
-            combined_data_csv.print();
+            preprocessed_data.write_to_path(destination)?;
         },
         "combine_incidence_stats_with_metadata" => {
             let incidence_stats_csv = &args[2];
@@ -1574,23 +2176,52 @@ fn main() -> anyhow::Result<()> {
             let combined = CombinedData::from_combination(incidence_stats_csv, metadata_csv);
             combined.print();
         },
+        "suggest_card_purchases" => {
+            let preprocessed_data = &args[2];
+            let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
+            let card_list = &args[3];
+            let card_list = std::fs::File::open(card_list)?;
+            let card_list = card_listing_from_file(card_list)?;
+            let card_list = card_list.normalize_against_preprocessed(&preprocessed_data);
+            preprocessed_data.suggest_card_purchases(card_list);
+        },
         "card_metadata" => {
             let scryfall_oracle_cards_file = &args[2];
             let cards_metadata = cards_metadata_from_scryfall(scryfall_oracle_cards_file)?;
             cards_metadata.print();
         },
+        "card_names_from_metadata" => {
+            let metadata_csv = &args[2];
+            let metadata_csv = std::fs::File::open(metadata_csv)?;
+            let metadata_csv = CardsMetadata::load_from_csv(metadata_csv)?;
+            metadata_csv.print_card_names();
+        },
+        "complete" => {
+            let method = args[2].as_str();
+            let preprocessed_data = &args[3];
+            let destination = &args[4];
+            let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
+            let preprocessed_data = match method {
+                "svt" => {
+                    preprocessed_data.complete_svt()
+                }
+                "soft-impute" => {
+                    preprocessed_data.complete_soft_impute()
+                }
+                _ => panic!("Unrecognized completion method - pick svt or alm"),
+            };
+            preprocessed_data.write_to_path(destination)?;
+        },
         "rank_commanders" => {
-            let combined_data = &args[2];
-            let combined_data = std::fs::File::open(combined_data)?;
-            let combined_data = CombinedData::load_from_csv(combined_data)?;
-            combined_data.rank_commanders();
+            let preprocessed_data = &args[2];
+            let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
+            preprocessed_data.rank_commanders();
         },
         "build_commander_deck" => {
-            let combined_data = &args[2];
-            let combined_data = std::fs::File::open(combined_data)?;
-            let combined_data = CombinedData::load_from_csv(combined_data)?;
+            let preprocessed_data = &args[2];
+            let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
             let commander_name = &args[3];
-            combined_data.build_commander_deck(commander_name);
+            preprocessed_data.build_commander_deck(commander_name);
         },
         _ => {
             print_usage();
