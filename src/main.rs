@@ -20,6 +20,7 @@ use ndarray_rand::RandomExt;
 use ndarray_rand::rand_distr::StandardNormal;
 use ndarray_linalg::qr::QR;
 use ndarray_linalg::Eigh;
+use ndarray_linalg::Inverse;
 
 extern crate openblas_src;
 
@@ -42,7 +43,7 @@ fn print_usage() -> ! {
     println!("cargo run filter_preprocessed [preprocessed_data] [card_list] [destination]");
     println!("cargo run suggest_card_purchases [preprocessed_data] [card_list]");
     println!("cargo run rank_commanders [preprocessed_data]");
-    println!("cargo run build_commander_deck [preprocessed_data] [commander_name]");
+    println!("cargo run build_commander_deck [preprocessed_data] [constraints_file] [commander_name]");
     panic!();
 }
 
@@ -92,12 +93,33 @@ fn sparse_times_dense(sparse: &CsrMatrix<f64>, dense: ArrayView2<f32>)
 }
 
 struct Constraint {
-    filter: MetadataFilter,
+    filter: CardFilter,
     count_lower_bound_inclusive: usize,
     count_upper_bound_inclusive: usize,
 }
 
 impl Constraint {
+    fn parse(text: &str) -> Self {
+        let (quantities, remainder) = text.split_once(' ').unwrap();
+        let filter = CardFilter::parse(remainder);
+        if quantities.contains('-') {
+            let (lower, upper) = quantities.split_once('-').unwrap();
+            let lower = str::parse::<usize>(lower).unwrap();
+            let upper = str::parse::<usize>(upper).unwrap();
+            Self {
+                filter,
+                count_lower_bound_inclusive: lower,
+                count_upper_bound_inclusive: upper,
+            }
+        } else {
+            let count = str::parse::<usize>(quantities).unwrap();
+            Self {
+                filter,
+                count_lower_bound_inclusive: count,
+                count_upper_bound_inclusive: count,
+            }
+        }
+    }
     fn count_distance(&self, actual_count: usize) -> usize {
         if actual_count < self.count_lower_bound_inclusive {
             self.count_lower_bound_inclusive - actual_count
@@ -114,28 +136,29 @@ struct Constraints {
 }
 
 impl Constraints {
-    fn default() -> Self {
+    fn load_from_file<R: std::io::Read>(file: R) -> anyhow::Result<Self> {
+        let reader = std::io::BufReader::new(file);
         let mut constraints = Vec::new();
-        
-        let land_constraint = Constraint {
-            filter: MetadataFilter::land(),
-            count_lower_bound_inclusive: 33,
-            count_upper_bound_inclusive: 40,
-        };
-
-        constraints.push(land_constraint);
-        Self {
-            constraints
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            let constraint = Constraint::parse(line);
+            constraints.push(constraint);
         }
+        Ok(Self {
+            constraints,
+        })
     }
     fn get_actual_counts(&self, active_set_indices: &[usize],
+                         all_names: &[String],
                          all_metadata: &[CardMetadata]) -> Vec<usize> {
         let mut result = Vec::new();
         for constraint in self.constraints.iter() {
             let mut count = 0;
             for index in active_set_indices {
+                let name = &all_names[*index];
                 let metadata = &all_metadata[*index];
-                if constraint.filter.matches(metadata) {
+                if constraint.filter.matches(name, metadata) {
                     count += 1;
                 }
             }
@@ -154,19 +177,23 @@ impl Constraints {
     fn get_updated_counts_for_swap(&self,
         actual_counts: &[usize],
         removed_index: usize, added_index: usize,
+        all_names: &[String],
         all_metadata: &[CardMetadata]) -> Vec<usize> {
 
         // Copy the previous collection of counts
         let mut result: Vec<usize> = actual_counts.iter().copied().collect();
 
+        let removed_name = &all_names[removed_index];
         let removed_metadata = &all_metadata[removed_index];
+
+        let added_name = &all_names[added_index];
         let added_metadata = &all_metadata[added_index];
 
         for (i, constraint) in self.constraints.iter().enumerate() {
-            if constraint.filter.matches(removed_metadata) {
+            if constraint.filter.matches(removed_name, removed_metadata) {
                 result[i] -= 1;
             }
-            if constraint.filter.matches(added_metadata) {
+            if constraint.filter.matches(added_name, added_metadata) {
                 result[i] += 1;
             }
         }
@@ -335,6 +362,10 @@ fn low_rank_sketch(U: ArrayView2<f32>, S: ArrayView1<f32>,
     sketch_rhs.t().dot(&sketch_rhs_scaled) // dims (s x s)
 }
 
+fn flat_view(X: &CsrMatrix<f64>) -> ArrayView1<f64> {
+    ArrayView::from_shape((X.nnz(),), X.values()).unwrap()
+}
+
 // Combined data which has been pre-processed to bring
 // it into a form which is immediately usable by the
 // rank_commanders and build_commander_deck commands.
@@ -355,6 +386,156 @@ impl PreprocessedData {
         let bytes = std::fs::read(path)?;
         let result: PreprocessedData = postcard::from_bytes(&bytes)?;
         Ok(result)
+    }
+    fn complete_rank_one_pursuit(mut self) -> Self {
+        // Uses the "Economic" version in https://arxiv.org/pdf/1404.1377.pdf,
+        // but generalized to deal with `k` singular values at every iteration.
+        let n = self.metadata.len();
+
+        let k = 8;
+
+        let (sparse_score_matrix, nnz) = to_sparse(self.score_matrix);
+        let epsilon = 0.03;
+
+        let mut original_matrix_frobenius_norm = 0.0;
+        for (_, _, value) in sparse_score_matrix.triplet_iter() {
+            original_matrix_frobenius_norm += *value * *value;
+        }
+        let original_matrix_frobenius_norm = original_matrix_frobenius_norm.sqrt();
+        
+        // Iteration matrix
+        let mut X = sparse_score_matrix.clone();
+        for (_, _, value) in X.triplet_iter_mut() {
+            *value = 0.0;
+        }
+
+        // Coefficient vector (weights of low-rank components)
+        let mut theta = Vec::new();
+
+        // The low-rank factors (expressed as a single unit-norm vector,
+        // we'll outer-product each of them with themselves to derive the M matrices)
+        let mut low_rank_factors = Vec::new();
+
+        loop {
+            let mut current_residual_frob_norm = 0.0;
+            let mut residual = sparse_score_matrix.clone();
+            for (residual_value, x_value) in
+                residual.values_mut().iter_mut().zip(X.values().iter()) {
+                *residual_value -= x_value;
+                current_residual_frob_norm += *residual_value * *residual_value;
+            }
+            let residual = residual;
+
+            let current_residual_frob_norm = current_residual_frob_norm.sqrt();
+            println!("Current residual frob norm: {}", current_residual_frob_norm);
+
+            if (current_residual_frob_norm / original_matrix_frobenius_norm) <=
+                epsilon {
+                // We're actually done, time to reconstruct
+                break;
+            }
+
+            // Pick out the top k singular vectors
+            let residual_svd_result = svdlibrs::svd_dim(&residual, k).unwrap();
+
+            // Construct M_{\omega}_l's
+            let mut M_omegas = Vec::new();
+            for l in 0..k {
+                let u = residual_svd_result.ut.row(l);
+                let mut M_omega = sparse_score_matrix.clone();
+                for (i, j, value) in M_omega.triplet_iter_mut() {
+                    *value = u[[i,]] * u[[j,]];
+                }
+                M_omegas.push(M_omega);
+            }
+            let M_omegas = M_omegas;
+
+            // We're done with the singular vectors for this iteration,
+            // store them for later.
+            for l in 0..k {
+                let u = residual_svd_result.ut.row(l);
+                low_rank_factors.push(u.into_owned());
+            }
+
+            // Now, find the coefficients for each low-rank component
+            // in the overall mixture.
+            let y_flat = flat_view(&sparse_score_matrix);
+
+            let mut Z_t = Array::zeros((k + 1, nnz));
+            Z_t.row_mut(0).assign(&flat_view(&X));
+            for (l, M_omega) in (0..k).zip(M_omegas.iter()) {
+                Z_t.row_mut(l + 1).assign(&flat_view(&M_omega));
+            }
+
+            let right_factor = Z_t.dot(&y_flat);
+            let normal_matrix = Z_t.dot(&Z_t.t());
+
+            // Compute the pseudoinverse of the normal matrix
+            let (mut normal_s, normal_u) = normal_matrix.eigh(UPLO::Upper).unwrap();
+            for value in normal_s.iter_mut() {
+                if *value != 0.0 {
+                    *value = 1.0 / *value;
+                }
+            }
+            let normal_matrix_inv = normal_u.dot(&Array2::from_diag(&normal_s))
+                                            .dot(&normal_u.t());
+            let coefs = normal_matrix_inv.dot(&right_factor);
+
+            // Update theta
+            for old_theta_value in theta.iter_mut() {
+                // All of the entries which were rolled up into
+                // X get multiplied by the first coefficient
+                *old_theta_value *= coefs[[0,]];
+            }
+            // All of the other coefficients get appended raw
+            for l in 0..k {
+                theta.push(coefs[[l + 1,]]);
+            }
+
+            // Update X
+            for x_value in X.values_mut() {
+                *x_value *= coefs[[0,]];
+            }
+            for l in 0..k {
+                let M_omega = &M_omegas[l];
+                let coef = coefs[[l + 1,]];
+                for (x_value, m_value) in
+                    X.values_mut().iter_mut().zip(M_omega.values().iter()) {
+                    *x_value += coef * m_value;
+                }
+            }
+        }
+        println!("Compacting low rank factors");
+        let k = low_rank_factors.len();
+        let mut us = Array::zeros((k, n));
+        for (i, low_rank_factor) in low_rank_factors.into_iter().enumerate() {
+            us.row_mut(i).assign(&low_rank_factor.mapv(|x| x as f32));
+        }
+        let us = us;
+
+        println!("Step 1 of score matrix reconstruction");
+
+        // Reconstruct the result
+        self.score_matrix = Array::zeros((n, n));
+
+        // Step 1 of reconstruction: Reconstruct low-rank component
+        for l in 0..k {
+            let u = us.row(l);
+            let coef = theta[l] as f32;
+            for i in 0..n {
+                let scaled_row = (coef * u[[i,]]) * &u;
+                self.score_matrix.row_mut(i).assign(&scaled_row);
+           }
+        }
+
+        println!("Step 2 of score matrix reconstruction");
+
+        // Step 2 of reconstruction: Fill known entries back in,
+        // since we don't want to erase those
+        for (i, j, value) in sparse_score_matrix.triplet_iter() {
+            self.score_matrix[[i, j]] = *value as f32;
+        }
+        self
     }
     fn complete_soft_impute(mut self) -> Self {
         // Uses a simplified version of https://arxiv.org/pdf/1703.05487.pdf
@@ -647,6 +828,7 @@ impl PreprocessedData {
                 // We already have it
                 continue;
             }
+            let type_line = self.metadata[id].card_types;
             let price_cents = self.metadata[id].price_cents;
             if price_cents == 0 {
                 // Price is actually undefined, skip 
@@ -655,13 +837,13 @@ impl PreprocessedData {
             let score = active_score[[id]];
             let score_per_cent = score / (price_cents as f32);
             let price = (price_cents as f32) / 100.0;
-            result.push((card_name, score, score_per_cent, price));
+            result.push((card_name, type_line, score, score_per_cent, price));
         }
-        result.sort_by(|(_, a, _, _), (_, b, _, _)| b.partial_cmp(&a).unwrap());
+        result.sort_by(|(_, _, a, _, _), (_, _, b, _, _)| b.partial_cmp(&a).unwrap());
 
-        for (card_name, score, score_per_cent, price) in result.into_iter() {
-            println!("{}, {}, {}, {}", format_card_name(&card_name), 
-                     score, score_per_cent, price);
+        for (card_name, type_line, score, score_per_cent, price) in result.into_iter() {
+            println!("{}, {}, {}, {}, {}", format_card_name(&card_name), 
+                     type_line.as_characters(), score, score_per_cent, price);
         }
     }
     fn merge_with_untrusted(self, mut untrusted: PreprocessedData) -> Self {
@@ -764,7 +946,7 @@ impl PreprocessedData {
         }
         None
     }
-    pub fn build_commander_deck(self, commander_name: &str) {
+    pub fn build_commander_deck(self, constraints: Constraints, commander_name: &str) {
         // SETUP
 
         // Early bail if we can't get the ID
@@ -866,11 +1048,17 @@ impl PreprocessedData {
             }
         }
 
-        let score_matrix = score_matrix;
+        // Finally, zero the diagonal in the score matrix, with the
+        // rough rationale being that there should be no isolated
+        // "good stuff" cards which don't synergize with the rest
+        // of the deck. Another line of reasoning is that the
+        // diagonal doesn't represent true card pairings, and
+        // so it should be excluded.
+        for i in 0..num_cards_in_pool {
+            score_matrix[[i, i]] = 0.0;
+        }
 
-        // For now, use the default constraints
-        // TODO: allow customization
-        let constraints = Constraints::default();
+        let score_matrix = score_matrix;
 
         // Number of optimization attempts
         // TODO: allow customization?
@@ -930,7 +1118,7 @@ impl PreprocessedData {
 
             // Determine the counts of constraint-filter-satisfying cards
             // in the current active set.
-            let mut constraint_counts = constraints.get_actual_counts(&active_set_indices, &metadata);
+            let mut constraint_counts = constraints.get_actual_counts(&active_set_indices, &reverse_id_map, &metadata);
             let mut constraint_count_distance = constraints.count_distance(&constraint_counts);
 
             // Determine the current objective value
@@ -966,7 +1154,7 @@ impl PreprocessedData {
 
                     // Determine what the updated constraint counts would be
                     let updated_constraint_counts = constraints.get_updated_counts_for_swap(
-                        &constraint_counts, index_removed, index_added, &metadata);
+                        &constraint_counts, index_removed, index_added, &reverse_id_map, &metadata);
                     let updated_constraint_count_distance = constraints.count_distance(&updated_constraint_counts);
 
                     if constraint_count_distance < updated_constraint_count_distance {
@@ -1031,21 +1219,57 @@ impl PreprocessedData {
             sorted_indices.push((best_active_set_indices[i], active_score[[i,]]));
         }
         sorted_indices.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap());
-            
+
+        let mut non_land_color_count = ColorCounts::new();
         // Print out the solution we found
         // Loop 1: Print out non-lands (required)
         // Loop 2: Print out lands (suggestions, could be swapped for basics)
-        println!("Non-Land Cards:");
         for (index, _) in sorted_indices.iter() {
             if !metadata[*index].card_types.has_type(CardType::Land) {
+                non_land_color_count.add(metadata[*index].color_identity);
                 println!("1 {}", reverse_id_map[*index]);
             }
         }
-        println!("Land Cards:");
+        println!("");
+        // For the lands, we're going to print out all the non-basics,
+        // but the basic lands will be saved for last
+        let mut basic_land_ids_to_counts: HashMap<_, usize> = HashMap::new();
+        let mut nonbasic_land_color_count = ColorCounts::new();
         for (index, _) in sorted_indices.iter() {
             if metadata[*index].card_types.has_type(CardType::Land) {
-                println!("1 {}", reverse_id_map[*index]);
+                if basic_land_ids.contains(index) {
+                    if basic_land_ids_to_counts.contains_key(index) {
+                        basic_land_ids_to_counts.get_mut(index).unwrap()
+                                                .add_assign(1);
+                    } else {
+                        basic_land_ids_to_counts.insert(*index, 1);
+                    }
+                } else {
+                    println!("1 {}", reverse_id_map[*index]);
+                    nonbasic_land_color_count.add(metadata[*index].color_identity);
+                }
             }
+        }
+        // Now, re-adjust the basic land counts to better-match the color
+        // identities of the non-land cards in play. This needs to be done
+        // because the optimization routine assigns a constant, very small
+        // value to each basic land to prevent flooding.
+        let mut total_basic_lands_count = 0;
+        for (_, count) in basic_land_ids_to_counts.iter() {
+            total_basic_lands_count += *count;
+        }
+        match non_land_color_count.get_colors_required_for_basics(
+            nonbasic_land_color_count, total_basic_lands_count) {
+            Some(recommended_color_counts) => {
+                recommended_color_counts.print_basic_lands();
+            },
+            None => {
+                // Something failed with that routine, instead just print
+                // the basic land counts, unmodified
+                for (id, count) in basic_land_ids_to_counts.drain() {
+                    println!("{} {}", count, reverse_id_map[id]);
+                }
+            },
         }
     }
 
@@ -1468,6 +1692,9 @@ impl CardTypes {
         let bitmask: u8 = card_type as u8;
         (self.bitfield & bitmask) > 0
     }
+    pub fn fits_within(&self, other: CardTypes) -> bool {
+        (self.bitfield | other.bitfield) == other.bitfield
+    }
     pub fn add_type(&mut self, card_type: CardType) {
         let bitmask: u8 = card_type as u8;
         self.bitfield |= bitmask;
@@ -1543,6 +1770,105 @@ impl Color {
     }
 }
 
+struct ColorCounts {
+    black: usize,
+    blue: usize,
+    green: usize,
+    red: usize,
+    white: usize,
+}
+
+impl ColorCounts {
+    fn new() -> Self {
+        Self {
+            black: 0,
+            blue: 0,
+            green: 0,
+            red: 0,
+            white: 0,
+        }
+    }
+    fn add(&mut self, color_identity: ColorIdentity) {
+        self.black += ((color_identity.bitfield & 1u8) > 0) as usize;
+        self.blue += ((color_identity.bitfield & 2u8) > 0) as usize;
+        self.green += ((color_identity.bitfield & 4u8) > 0) as usize;
+        self.red += ((color_identity.bitfield & 8u8) > 0) as usize;
+        self.white += ((color_identity.bitfield & 16u8) > 0) as usize;
+    }
+    fn print_basic_lands(&self) {
+        if self.black > 0 {
+            println!("{} Swamp", self.black);
+        }
+        if self.blue > 0 {
+            println!("{} Island", self.blue);
+        }
+        if self.green > 0 {
+            println!("{} Forest", self.green);
+        }
+        if self.red > 0 {
+            println!("{} Mountain", self.red);
+        }
+        if self.white > 0 {
+            println!("{} Plains", self.white);
+        }
+    }
+    // Assumes that this is the color-counts of non-land-cards,
+    // and that the second argument is the color-counts of lands
+    fn get_colors_required_for_basics(&self, other_lands_counts: ColorCounts,
+                                      num_basic_lands: usize) 
+            -> Option<ColorCounts> {
+        let black = self.black.saturating_sub(other_lands_counts.black);
+        let blue = self.blue.saturating_sub(other_lands_counts.blue);
+        let green = self.green.saturating_sub(other_lands_counts.green);
+        let red = self.red.saturating_sub(other_lands_counts.red);
+        let white = self.white.saturating_sub(other_lands_counts.white);
+        let total = black + blue + green + red + white;
+        if total == 0 {
+            return None;
+        }
+        let total = total as f64;
+        
+        let scale = |value: usize| {
+            (((value as f64) / total) * (num_basic_lands as f64)).ceil() as usize
+        };
+        let mut black = scale(black);
+        let mut blue = scale(blue);
+        let mut green = scale(green);
+        let mut red = scale(red);
+        let mut white = scale(white);
+
+        let mut result_total = black + blue + green + red + white;
+        if result_total == 0 {
+            // Punt 
+            return None;
+        }
+        
+        // Get to `num_basic_lands` if we went over
+        while result_total > num_basic_lands {
+            if black > 0 {
+                black = black.saturating_sub(1);
+            } else if blue > 0 {
+                blue = blue.saturating_sub(1);
+            } else if green > 0 {
+                green = green.saturating_sub(1);
+            } else if red > 0 {
+                red = red.saturating_sub(1);
+            } else if white > 0 {
+                white = white.saturating_sub(1);
+            }
+            result_total -= 1;
+        }
+
+        Some(Self {
+            black,
+            blue,
+            green,
+            red,
+            white,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 struct ColorIdentity {
     bitfield: u8,
@@ -1594,20 +1920,66 @@ impl ColorIdentity {
     }
 }
 
-enum MetadataFilter {
-    CardTypeContains(CardType),
+enum CardFilter {
+    TypeContains(CardTypes),
+    // Units: cents
+    InPriceRange(u16, u16),
+    CmcInRange(u8, u8),
+    Named(String),
 }
 
-impl MetadataFilter {
-    pub fn matches(&self, metadata: &CardMetadata) -> bool {
+impl CardFilter {
+    pub fn parse(text: &str) -> Self {
+        // First, split off the operator from the arguments
+        let (operator, remainder) = text.split_once(" ").unwrap();
+        match operator {
+            "named" => {
+                let name = parse_card_name(remainder);
+                Self::Named(name)
+            },
+            "type_contains" => {
+                let card_types = CardTypes::parse_from_characters(remainder);
+                Self::TypeContains(card_types)
+            },
+            "cmc_in_range" => {
+                let (lower_bound, upper_bound) = remainder.split_once('-').unwrap();     
+                let lower_bound = str::parse::<usize>(lower_bound).unwrap() as u8;
+                let upper_bound = str::parse::<usize>(upper_bound).unwrap() as u8;
+                Self::CmcInRange(lower_bound, upper_bound) 
+            },
+            "in_price_range" => {
+                let (lower_bound, upper_bound) = remainder.split_once('-').unwrap();
+                let lower_bound = str::parse::<f64>(lower_bound).unwrap();
+                let upper_bound = str::parse::<f64>(upper_bound).unwrap();
+                let lower_bound = (lower_bound * 100.0) as u16;
+                let upper_bound = (upper_bound * 100.0) as u16;
+                Self::InPriceRange(lower_bound, upper_bound)
+            },
+            _ => {
+                panic!("Unknown operator: {}", operator);
+            },
+        }
+    }
+    pub fn matches(&self, name: &str, metadata: &CardMetadata) -> bool {
         match self {
-            Self::CardTypeContains(t) => {
-                metadata.card_types.has_type(t.clone())
+            Self::TypeContains(t) => {
+                t.fits_within(metadata.card_types)
+            },
+            Self::InPriceRange(l, h) => {
+                *l <= metadata.price_cents &&
+                metadata.price_cents <= *h
+            },
+            Self::CmcInRange(l, h) => {
+                *l <= metadata.cmc &&
+                metadata.cmc <= *h
+            },
+            Self::Named(s) => {
+                s == name
             }
         }
     }
-    pub fn land() -> MetadataFilter {
-        Self::CardTypeContains(CardType::Land)
+    pub fn land() -> CardFilter {
+        Self::TypeContains(CardTypes::parse_from_characters("l"))
     }
 }
 
@@ -2204,10 +2576,13 @@ fn main() -> anyhow::Result<()> {
             let preprocessed_data = match method {
                 "svt" => {
                     preprocessed_data.complete_svt()
-                }
+                },
                 "soft-impute" => {
                     preprocessed_data.complete_soft_impute()
-                }
+                },
+                "rank-one-pursuit" => {
+                    preprocessed_data.complete_rank_one_pursuit()
+                },
                 _ => panic!("Unrecognized completion method - pick svt or alm"),
             };
             preprocessed_data.write_to_path(destination)?;
@@ -2220,8 +2595,11 @@ fn main() -> anyhow::Result<()> {
         "build_commander_deck" => {
             let preprocessed_data = &args[2];
             let preprocessed_data = PreprocessedData::load_from_path(preprocessed_data)?;
-            let commander_name = &args[3];
-            preprocessed_data.build_commander_deck(commander_name);
+            let constraints_file = &args[3];
+            let constraints_file = std::fs::File::open(constraints_file)?;
+            let constraints = Constraints::load_from_file(constraints_file)?;
+            let commander_name = &args[4];
+            preprocessed_data.build_commander_deck(constraints, commander_name);
         },
         _ => {
             print_usage();
